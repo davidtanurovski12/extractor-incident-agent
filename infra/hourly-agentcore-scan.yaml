@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Invoke the extractor incident AgentCore runtime hourly for all configured services.
+
+Parameters:
+  AgentRuntimeArn:
+    Type: String
+    Description: ARN of the deployed AgentCore runtime.
+  ScheduleExpression:
+    Type: String
+    Default: rate(1 hour)
+    Description: EventBridge Scheduler expression; rate expressions use UTC.
+  ScheduleName:
+    Type: String
+    Default: extractor-incident-hourly-scan
+  AgentLogGroupName:
+    Type: String
+    Default: /aws/bedrock-agentcore/extractor-incident-investigator
+    Description: CloudWatch Logs group for the AgentCore runtime's application logs.
+
+Resources:
+  AgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref AgentLogGroupName
+      RetentionInDays: 30
+
+  AgentLogSource:
+    Type: AWS::Logs::DeliverySource
+    Properties:
+      Name: !Sub ${AWS::StackName}-agent-logs
+      LogType: APPLICATION_LOGS
+      ResourceArn: !Ref AgentRuntimeArn
+
+  AgentLogDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Properties:
+      Name: !Sub ${AWS::StackName}-agent-logs
+      DeliveryDestinationType: CWL
+      DestinationResourceArn: !GetAtt AgentLogGroup.Arn
+
+  AgentLogDelivery:
+    Type: AWS::Logs::Delivery
+    Properties:
+      DeliverySourceName: !Ref AgentLogSource
+      DeliveryDestinationArn: !GetAtt AgentLogDestination.Arn
+
+  ScannerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeIncidentAgentRuntime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource: !Ref AgentRuntimeArn
+
+  ScannerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ScannerLambdaRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      Environment:
+        Variables:
+          AGENT_RUNTIME_ARN: !Ref AgentRuntimeArn
+          AGENTCORE_REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          import uuid
+
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              client = boto3.client("bedrock-agentcore", region_name=os.environ["AGENTCORE_REGION"])
+              response = client.invoke_agent_runtime(
+                  agentRuntimeArn=os.environ["AGENT_RUNTIME_ARN"],
+                  runtimeSessionId=str(uuid.uuid4()),
+                  contentType="application/json",
+                  accept="application/json",
+                  payload=json.dumps({"scan_all_services": True}).encode("utf-8"),
+              )
+              body = response.get("response")
+              if body is None:
+                  result = b""
+              elif hasattr(body, "iter_lines"):
+                  lines = []
+                  for line in body.iter_lines(chunk_size=10):
+                      if line:
+                          lines.append(line.encode("utf-8") if isinstance(line, str) else line)
+                  result = b"\n".join(lines)
+              elif hasattr(body, "read"):
+                  result = body.read()
+              else:
+                  result = b"".join(
+                      event.get("chunk", {}).get("bytes", b"")
+                      for event in body if isinstance(event, dict)
+                  )
+              status_code = response.get("statusCode", 0)
+              logger.info(json.dumps({
+                  "event": "agentcore.hourly_scan.finished",
+                  "status_code": status_code,
+                  "response_bytes": len(result),
+              }))
+              if status_code != 200:
+                  raise RuntimeError(f"AgentCore invocation returned HTTP {status_code}")
+              result_json = {}
+              try:
+                  result_json = json.loads(result)
+              except (UnicodeDecodeError, json.JSONDecodeError):
+                  for line in result.splitlines():
+                      if line.startswith(b"data:"):
+                          try:
+                              result_json = json.loads(line[5:].strip())
+                          except (UnicodeDecodeError, json.JSONDecodeError):
+                              continue
+              failed = [item.get("service_name") for item in result_json.get("reports", [])
+                        if item.get("status") != "completed"]
+              if failed:
+                  raise RuntimeError("Service scans failed: " + ", ".join(failed))
+              return {"statusCode": status_code}
+
+  SchedulerInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeScannerLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ScannerLambda.Arn
+
+  HourlySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Ref ScheduleName
+      Description: Scan Zendesk, Salesforce, Jira, and ServiceNow extractor logs hourly.
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      FlexibleTimeWindow:
+        Mode: OFF
+      Target:
+        Arn: !GetAtt ScannerLambda.Arn
+        RoleArn: !GetAtt SchedulerInvokeRole.Arn
+        Input: '{"trigger":"hourly-extractor-log-scan"}'
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 3600
+          MaximumRetryAttempts: 3
+
+  AllowSchedulerInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScannerLambda
+      Action: lambda:InvokeFunction
+      Principal: scheduler.amazonaws.com
+      SourceArn: !GetAtt HourlySchedule.Arn
+
+Outputs:
+  ScheduleArn:
+    Value: !GetAtt HourlySchedule.Arn
+  ScannerLambdaName:
+    Value: !Ref ScannerLambda
+  AgentLogGroupName:
+    Value: !Ref AgentLogGroup
